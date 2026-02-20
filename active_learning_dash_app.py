@@ -10,14 +10,14 @@ Layout
  Row 2:  Slider to pick iteration
 """
 
-import numpy as np
 import torch
 from botorch.fit import fit_gpytorch_mll
 from botorch.models import SingleTaskGP
+from botorch.models.transforms.input import Normalize
+from botorch.models.transforms.outcome import Standardize
 from botorch.test_functions import Branin
 from botorch.acquisition.analytic import PosteriorStandardDeviation
 from botorch.optim import optimize_acqf
-from botorch.utils.transforms import normalize, unnormalize
 from gpytorch.mlls import ExactMarginalLogLikelihood
 
 import dash
@@ -42,7 +42,6 @@ x1 = torch.linspace(bounds[0, 0].item(), bounds[1, 0].item(), GRID_RES, **tkwarg
 x2 = torch.linspace(bounds[0, 1].item(), bounds[1, 1].item(), GRID_RES, **tkwargs)
 X1, X2 = torch.meshgrid(x1, x2, indexing="ij")
 grid = torch.stack([X1.reshape(-1), X2.reshape(-1)], dim=-1)  # (GRID_RES^2, 2)
-grid_norm = normalize(grid, bounds)
 
 true_Y = branin(grid).reshape(GRID_RES, GRID_RES).detach().numpy()
 x1_np, x2_np = x1.numpy(), x2.numpy()
@@ -58,16 +57,28 @@ print("Running active-learning loop …")
 train_X = bounds[0] + (bounds[1] - bounds[0]) * torch.rand(N_INITIAL, 2, **tkwargs)
 train_Y = evaluate(train_X)
 
+# Fixed near-zero observation noise: the objective is deterministic.
+# Omit train_Yvar to let the GP estimate the noise variance from data
+# (useful when observations are noisy).
+train_Yvar = torch.full_like(train_Y, 1e-6)
+
 snapshots = []  # one dict per iteration (including iteration 0 = before any AL)
 
 for i in range(N_ITERATIONS + 1):
-    X_norm = normalize(train_X, bounds)
-    gp = SingleTaskGP(X_norm, train_Y).to(**tkwargs)
+    # Normalize and Standardize let BoTorch handle input/output scaling
+    # automatically; we work in the original input space everywhere.
+    gp = SingleTaskGP(
+        train_X,
+        train_Y,
+        train_Yvar=train_Yvar,
+        input_transform=Normalize(d=2, bounds=bounds),
+        outcome_transform=Standardize(m=1),
+    ).to(**tkwargs)
     mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
     fit_gpytorch_mll(mll)
 
     with torch.no_grad():
-        posterior = gp.posterior(grid_norm)
+        posterior = gp.posterior(grid)
         mean = posterior.mean.squeeze(-1).numpy().reshape(GRID_RES, GRID_RES)
         std = posterior.variance.squeeze(-1).sqrt().numpy().reshape(GRID_RES, GRID_RES)
 
@@ -86,17 +97,18 @@ for i in range(N_ITERATIONS + 1):
 
     # Pick next point
     acqf = PosteriorStandardDeviation(model=gp)
-    cand_norm, _ = optimize_acqf(
+    candidate, _ = optimize_acqf(
         acq_function=acqf,
-        bounds=torch.stack([torch.zeros(2, **tkwargs), torch.ones(2, **tkwargs)]),
+        bounds=bounds,
         q=1,
         num_restarts=8,
         raw_samples=128,
     )
-    new_X = unnormalize(cand_norm, bounds)
+    new_X = candidate
     new_Y = evaluate(new_X)
     train_X = torch.cat([train_X, new_X])
     train_Y = torch.cat([train_Y, new_Y])
+    train_Yvar = torch.full_like(train_Y, 1e-6)
 
 print("Done. Starting Dash server …\n")
 

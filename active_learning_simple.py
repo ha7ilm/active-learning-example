@@ -15,10 +15,11 @@ After the loop we plot the model's predictions vs. the true function.
 import torch
 from botorch.fit import fit_gpytorch_mll
 from botorch.models import SingleTaskGP
+from botorch.models.transforms.input import Normalize
+from botorch.models.transforms.outcome import Standardize
 from botorch.test_functions import Branin
 from botorch.acquisition.analytic import PosteriorStandardDeviation
 from botorch.optim import optimize_acqf
-from botorch.utils.transforms import normalize, unnormalize
 from gpytorch.mlls import ExactMarginalLogLikelihood
 
 # ── Settings ──────────────────────────────────────────────────────────────
@@ -41,38 +42,45 @@ def evaluate(X):
 train_X = bounds[0] + (bounds[1] - bounds[0]) * torch.rand(N_INITIAL, 2, **tkwargs)
 train_Y = evaluate(train_X)
 
+# Fixed near-zero observation noise: the objective is deterministic.
+# Omit train_Yvar to let the GP estimate the noise variance from data
+# (useful when observations are noisy).
+TRAIN_YVAR = torch.full_like(train_Y, 1e-6)
+
 print(f"{'Iter':>4}  {'New x1':>8}  {'New x2':>8}  {'f(x)':>10}  {'Model RMSE':>10}")
 print("-" * 52)
 
 # ── Active-learning loop ─────────────────────────────────────────────────
 for i in range(N_ITERATIONS):
-    # Normalize inputs to [0, 1] for better GP conditioning
-    X_norm = normalize(train_X, bounds)
-
-    # Fit GP
-    gp = SingleTaskGP(X_norm, train_Y).to(**tkwargs)
+    # Fit GP – Normalize and Standardize let BoTorch handle input/output
+    # scaling automatically; we work in the original input space everywhere.
+    gp = SingleTaskGP(
+        train_X,
+        train_Y,
+        train_Yvar=TRAIN_YVAR,
+        input_transform=Normalize(d=2, bounds=bounds),
+        outcome_transform=Standardize(m=1),
+    ).to(**tkwargs)
     mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
     fit_gpytorch_mll(mll)
 
     # Acquisition: maximize posterior std dev (uncertainty sampling)
     acqf = PosteriorStandardDeviation(model=gp)
-    candidate_norm, acq_value = optimize_acqf(
+    candidate, acq_value = optimize_acqf(
         acq_function=acqf,
-        bounds=torch.stack([torch.zeros(2, **tkwargs), torch.ones(2, **tkwargs)]),
+        bounds=bounds,
         q=1,
         num_restarts=8,
         raw_samples=128,
     )
 
-    # Un-normalize candidate back to original space
-    new_X = unnormalize(candidate_norm, bounds)
+    new_X = candidate
     new_Y = evaluate(new_X)
 
     # Compute model RMSE on a test grid
     with torch.no_grad():
         test_X = bounds[0] + (bounds[1] - bounds[0]) * torch.rand(500, 2, **tkwargs)
-        test_X_norm = normalize(test_X, bounds)
-        pred = gp.posterior(test_X_norm).mean
+        pred = gp.posterior(test_X).mean
         rmse = (pred - evaluate(test_X)).pow(2).mean().sqrt().item()
 
     print(
@@ -83,6 +91,7 @@ for i in range(N_ITERATIONS):
     # Augment training data
     train_X = torch.cat([train_X, new_X])
     train_Y = torch.cat([train_Y, new_Y])
+    TRAIN_YVAR = torch.full_like(train_Y, 1e-6)
 
 print(f"\nTotal evaluations: {train_X.shape[0]}  (initial {N_INITIAL} + {N_ITERATIONS} AL steps)")
 print("Done.")
