@@ -1,3 +1,5 @@
+![Screenshot](screenshot.png)
+
 # Active Learning with BoTorch
 
 An interactive educational example of **active learning** using
