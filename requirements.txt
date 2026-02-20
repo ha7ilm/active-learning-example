@@ -1,0 +1,5 @@
+botorch>=0.14
+torch>=2.0
+gpytorch
+dash
+plotly
